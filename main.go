@@ -1,95 +1,179 @@
 package main
 
 import (
-	"fmt"
-	"sync"
+	"encoding/json"
+	"flag"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
 	"time"
+
+	"go-cache/internals/cache"
 )
 
-type CacheItem struct {
-	Value      interface{}
-	Expiration int64 // Unix timestamp in nanoseconds or seconds
+type SetRequest struct {
+	Key   string      `json:"key"`
+	Value interface{} `json:"value"`
+	TTLMs int         `json:"ttl_ms"`
 }
 
-type Cache struct {
-	mu    sync.RWMutex
-	store map[string]CacheItem
-}
-
-// Fixed the syntax error here
-func NewCache() *Cache {
-	return &Cache{
-		store: make(map[string]CacheItem),
-	}
-}
-
-// Changed expiration to time.Duration for a cleaner API
-func (c *Cache) Set(key string, value interface{}, ttl time.Duration) {
-	var expiration int64
-	if ttl > 0 {
-		expiration = time.Now().Add(ttl).UnixNano() // Using nanoseconds for higher precision
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.store[key] = CacheItem{
-		Value:      value,
-		Expiration: expiration,
-	}
-}
-
-func (c *Cache) Get(key string) (interface{}, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	item, ok := c.store[key]
-	if !ok {
-		return nil, false
-	}
-
-	// Fixed passive TTL check to match UnixNano
-	if item.Expiration > 0 && item.Expiration < time.Now().UnixNano() {
-		// Note: The item is expired, but it still exists in c.store memory.
-		// We will handle deleting it during Day 2 (Active TTL Engine).
-		return nil, false
-	}
-
-	return item.Value, true
-}
-
-func (c *Cache) Delete(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.store, key)
-}
 func main() {
-	cache := NewCache()
-	var wg sync.WaitGroup
+	// Parse CLI flags or fallback to environment variables
+	portFlag := flag.String("port", getEnv("PORT", "8080"), "Port to listen on")
+	maxSizeFlag := flag.Int("max-size", getEnvInt("MAX_SIZE", 1000), "Maximum cache size before eviction")
+	cleanupIntervalFlag := flag.Duration("cleanup-interval", getEnvDuration("CLEANUP_INTERVAL", 10*time.Second), "Interval for the active TTL cleanup janitor")
+	flag.Parse()
 
-	// Concurrently write to the cache
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			key := fmt.Sprintf("key-%d", id)
-			cache.Set(key, id, 2*time.Second)
-		}(i)
+	log.Printf("Starting SentinelCache Node...")
+	log.Printf("Configuration: Port=%s, MaxSize=%d, CleanupInterval=%v", *portFlag, *maxSizeFlag, *cleanupIntervalFlag)
+
+	// Initialize the LRU cache
+	c := cache.NewCacheWithMaxSize(*maxSizeFlag)
+
+	// Start the active TTL janitor
+	c.StartJanitor(*cleanupIntervalFlag)
+	defer c.StopJanitor()
+
+	// Register HTTP routes
+	mux := http.NewServeMux()
+	mux.HandleFunc("/set", handleSet(c))
+	mux.HandleFunc("/get", handleGet(c))
+	mux.HandleFunc("/delete", handleDelete(c))
+	mux.HandleFunc("/health", handleHealth())
+
+	// Start server
+	serverAddr := ":" + *portFlag
+	log.Printf("Listening and serving HTTP on %s", serverAddr)
+	if err := http.ListenAndServe(serverAddr, mux); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
 	}
+}
 
-	// Concurrently read from the cache
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			key := fmt.Sprintf("key-%d", id)
-			val, found := cache.Get(key)
-			if found {
-				fmt.Printf("Found %s: %v\n", key, val)
-			}
-		}(i)
+func handleSet(c *cache.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req SetRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+
+		if req.Key == "" {
+			http.Error(w, `{"error": "Key is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		var ttl time.Duration
+		if req.TTLMs > 0 {
+			ttl = time.Duration(req.TTLMs) * time.Millisecond
+		}
+
+		c.Set(req.Key, req.Value, ttl)
+		log.Printf("[SET] Key: %s, TTL: %v", req.Key, ttl)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"key":     req.Key,
+			"success": true,
+		})
 	}
+}
 
-	wg.Wait()
-	fmt.Println("Day 1 Core Engine Verified Thread-Safe!")
+func handleGet(c *cache.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, `{"error": "Key is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		val, found := c.Get(key)
+		w.Header().Set("Content-Type", "application/json")
+
+		if !found {
+			log.Printf("[GET] Key: %s - MISS", key)
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"key":   key,
+				"found": false,
+			})
+			return
+		}
+
+		log.Printf("[GET] Key: %s - HIT", key)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"key":   key,
+			"value": val,
+			"found": true,
+		})
+	}
+}
+
+func handleDelete(c *cache.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, `{"error": "Key is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		c.Delete(key)
+		log.Printf("[DELETE] Key: %s", key)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"key":     key,
+			"success": true,
+		})
+	}
+}
+
+func handleHealth() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "healthy",
+		})
+	}
+}
+
+// Helper functions to fetch and parse environment variables
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if valStr, exists := os.LookupEnv(key); exists {
+		if val, err := strconv.Atoi(valStr); err == nil {
+			return val
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if valStr, exists := os.LookupEnv(key); exists {
+		if val, err := time.ParseDuration(valStr); err == nil {
+			return val
+		}
+	}
+	return fallback
 }
