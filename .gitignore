@@ -1,0 +1,20 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local Go/build cache
+.gocache/
+
+# Env/local config
+.env
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
