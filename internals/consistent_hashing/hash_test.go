@@ -95,3 +95,25 @@ func TestHashRing_Distribution(t *testing.T) {
 		t.Errorf("Distribution failed: at least one node has 0 keys mapped. Distribution: %+v", counts)
 	}
 }
+
+func TestHashRing_GetNodes(t *testing.T) {
+	hr := NewHashRing(3)
+	hr.AddNode("node1")
+	hr.AddNode("node2")
+	hr.AddNode("node3")
+
+	// Get 2 nodes
+	nodes := hr.GetNodes("some-test-key", 2)
+	if len(nodes) != 2 {
+		t.Fatalf("Expected 2 nodes, got %d", len(nodes))
+	}
+	if nodes[0] == nodes[1] {
+		t.Errorf("Expected distinct nodes, got duplicate: %v", nodes)
+	}
+
+	// Requesting more nodes than exist in the ring should return all unique physical nodes
+	nodes = hr.GetNodes("some-test-key", 5)
+	if len(nodes) != 3 {
+		t.Fatalf("Expected 3 nodes (maximum available), got %d", len(nodes))
+	}
+}

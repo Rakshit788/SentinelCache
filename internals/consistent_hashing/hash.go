@@ -87,3 +87,43 @@ func (h *HashRing) GetNode(key string) string {
 
 	return h.nodes[h.ring[idx]]
 }
+
+// GetNodes retrieves the next n unique physical nodes on the ring starting from the given key.
+func (h *HashRing) GetNodes(key string, n int) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.ring) == 0 || n <= 0 {
+		return nil
+	}
+
+	keyHash := h.hash(key)
+
+	// Binary search to find the first virtual node hash >= keyHash
+	idx := sort.Search(len(h.ring), func(i int) bool {
+		return h.ring[i] >= keyHash
+	})
+
+	// Wrap around if necessary
+	if idx == len(h.ring) {
+		idx = 0
+	}
+
+	seen := make(map[string]bool)
+	var nodes []string
+
+	// Traverse the ring to collect up to n unique physical nodes
+	for i := 0; i < len(h.ring); i++ {
+		currIdx := (idx + i) % len(h.ring)
+		node := h.nodes[h.ring[currIdx]]
+		if !seen[node] {
+			seen[node] = true
+			nodes = append(nodes, node)
+			if len(nodes) == n {
+				break
+			}
+		}
+	}
+
+	return nodes
+}
