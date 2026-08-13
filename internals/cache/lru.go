@@ -1,24 +1,27 @@
 package cache
 
-func NewCacheWithMaxSize(maxSize int) *Cache {
-	c := NewCache()
-	c.maxSize = maxSize
-	return c
-}
+import "sync/atomic"
 
-func (c *Cache) evictOldest() {
-	elem := c.ll.Back()
+// evictOldest removes the least-recently-used entry from the shard.
+// Callers must hold s.mu.
+func (s *shard) evictOldest() {
+	elem := s.ll.Back()
 	if elem == nil {
 		return
 	}
 	key := elem.Value.(string)
-	c.ll.Remove(elem)
-	delete(c.keys, key)
-	delete(c.store, key)
+	s.ll.Remove(elem)
+	delete(s.keys, key)
+	delete(s.store, key)
+	atomic.AddInt64(&s.evictions, 1)
 }
 
 func (c *Cache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.ll.Len()
+	total := 0
+	for _, s := range c.shards {
+		s.mu.RLock()
+		total += s.ll.Len()
+		s.mu.RUnlock()
+	}
+	return total
 }
