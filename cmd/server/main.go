@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"go-cache/internals/cache"
@@ -16,6 +20,11 @@ type SetRequest struct {
 	Key   string      `json:"key"`
 	Value interface{} `json:"value"`
 	TTLMs int         `json:"ttl_ms"`
+	// Version is optional. When set (by the proxy, coordinating a single
+	// logical write across replicas, or by read repair) it is applied via
+	// last-write-wins instead of generating a fresh version locally, so
+	// every replica agrees on the same version for the same write.
+	Version int64 `json:"version,omitempty"`
 }
 
 func main() {
@@ -33,21 +42,45 @@ func main() {
 
 	// Start the active TTL janitor
 	c.StartJanitor(*cleanupIntervalFlag)
-	defer c.StopJanitor()
+
+	m := newServerMetrics()
 
 	// Register HTTP routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/set", handleSet(c))
-	mux.HandleFunc("/get", handleGet(c))
-	mux.HandleFunc("/delete", handleDelete(c))
+	mux.HandleFunc("/set", withMetrics("set", m, handleSet(c)))
+	mux.HandleFunc("/get", withMetrics("get", m, handleGet(c)))
+	mux.HandleFunc("/delete", withMetrics("delete", m, handleDelete(c)))
 	mux.HandleFunc("/health", handleHealth())
+	mux.HandleFunc("/metrics", handleMetrics(c, m))
 
 	// Start server
-	serverAddr := ":" + *portFlag
-	log.Printf("Listening and serving HTTP on %s", serverAddr)
-	if err := http.ListenAndServe(serverAddr, mux); err != nil {
-		log.Fatalf("Server failed to start: %v", err)
+	srv := &http.Server{
+		Addr:    ":" + *portFlag,
+		Handler: mux,
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("Listening and serving HTTP on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Server failed to start: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("Shutdown signal received, draining connections...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v", err)
+	}
+
+	c.StopJanitor()
+	log.Printf("Server stopped cleanly")
 }
 
 func handleSet(c *cache.Cache) http.HandlerFunc {
@@ -73,13 +106,22 @@ func handleSet(c *cache.Cache) http.HandlerFunc {
 			ttl = time.Duration(req.TTLMs) * time.Millisecond
 		}
 
-		c.Set(req.Key, req.Value, ttl)
-		log.Printf("[SET] Key: %s, TTL: %v", req.Key, ttl)
+		var version int64
+		applied := true
+		if req.Version > 0 {
+			version = req.Version
+			applied = c.SetWithVersion(req.Key, req.Value, ttl, req.Version)
+		} else {
+			version = c.Set(req.Key, req.Value, ttl)
+		}
+		log.Printf("[SET] Key: %s, TTL: %v, Version: %d, Applied: %v", req.Key, ttl, version, applied)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"key":     req.Key,
 			"success": true,
+			"applied": applied,
+			"version": version,
 		})
 	}
 }
@@ -97,7 +139,7 @@ func handleGet(c *cache.Cache) http.HandlerFunc {
 			return
 		}
 
-		val, found := c.Get(key)
+		val, version, expiresAt, found := c.Get(key)
 		w.Header().Set("Content-Type", "application/json")
 
 		if !found {
@@ -110,11 +152,13 @@ func handleGet(c *cache.Cache) http.HandlerFunc {
 			return
 		}
 
-		log.Printf("[GET] Key: %s - HIT", key)
+		log.Printf("[GET] Key: %s - HIT (version %d)", key, version)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"key":   key,
-			"value": val,
-			"found": true,
+			"key":        key,
+			"value":      val,
+			"found":      true,
+			"version":    version,
+			"expires_at": expiresAt,
 		})
 	}
 }
@@ -152,7 +196,7 @@ func handleHealth() http.HandlerFunc {
 	}
 }
 
-// Helper functions to fetch and parse environment variables
+
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value

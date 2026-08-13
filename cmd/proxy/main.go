@@ -1,18 +1,18 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go-cache/internals/consistent_hashing"
@@ -22,12 +22,43 @@ type SetRequest struct {
 	Key   string      `json:"key"`
 	Value interface{} `json:"value"`
 	TTLMs int         `json:"ttl_ms"`
+	// Version is set by the proxy once per logical write and sent
+	// unchanged to every replica, so all replicas agree on a single
+	// version for the same write instead of each generating their own.
+	Version int64 `json:"version,omitempty"`
+}
+
+type GetResponse struct {
+	Key       string      `json:"key"`
+	Value     interface{} `json:"value"`
+	Found     bool        `json:"found"`
+	Version   int64       `json:"version"`
+	ExpiresAt int64       `json:"expires_at"`
+}
+
+type nodeHealth struct {
+	mu               sync.Mutex
+	healthy          bool
+	inRing           bool
+	consecutiveOK    int
+	consecutiveFails int
 }
 
 type ProxyServer struct {
 	ring              *consistenthash.HashRing
 	client            *http.Client
+	healthClient      *http.Client
 	replicationFactor int
+	writeQuorum       int
+	readQuorum        int
+
+	// allNodes is the full static node list, independent of ring
+	// membership, so the health checker keeps probing nodes that have
+	// been removed from the ring and can add them back once they recover.
+	allNodes []string
+	health   map[string]*nodeHealth
+
+	metrics *proxyMetrics
 }
 
 func main() {
@@ -35,242 +66,88 @@ func main() {
 	nodesFlag := flag.String("nodes", getEnv("NODES", "http://cache-node-1:8080,http://cache-node-2:8080,http://cache-node-3:8080"), "Comma-separated list of backend node URLs")
 	vnodesFlag := flag.Int("vnodes", getEnvInt("VNODES", 50), "Number of virtual nodes per physical node")
 	replFlag := flag.Int("replication", getEnvInt("REPLICATION", 2), "Replication factor N")
+	writeQuorumFlag := flag.Int("write-quorum", getEnvInt("WRITE_QUORUM", 1), "Number of replica acks required for a write to succeed (W)")
+	readQuorumFlag := flag.Int("read-quorum", getEnvInt("READ_QUORUM", 1), "Number of replica responses required for a read to succeed (R)")
+	healthIntervalFlag := flag.Duration("health-interval", getEnvDuration("HEALTH_INTERVAL", 2*time.Second), "Interval between node health checks")
+	healthFailThresholdFlag := flag.Int("health-fail-threshold", getEnvInt("HEALTH_FAIL_THRESHOLD", 3), "Consecutive failed health checks before a node is removed from the ring")
+	healthRecoverThresholdFlag := flag.Int("health-recover-threshold", getEnvInt("HEALTH_RECOVER_THRESHOLD", 2), "Consecutive successful health checks before a removed node rejoins the ring")
 	flag.Parse()
 
+	replicationFactor := *replFlag
+	writeQuorum := clamp(*writeQuorumFlag, 1, replicationFactor)
+	readQuorum := clamp(*readQuorumFlag, 1, replicationFactor)
+
 	log.Printf("Starting SentinelCache Proxy Router...")
-	log.Printf("Configuration: Port=%s, Nodes=%s, Vnodes=%d, Replication=%d", *portFlag, *nodesFlag, *vnodesFlag, *replFlag)
+	log.Printf("Configuration: Port=%s, Nodes=%s, Vnodes=%d, Replication=%d, WriteQuorum=%d, ReadQuorum=%d",
+		*portFlag, *nodesFlag, *vnodesFlag, replicationFactor, writeQuorum, readQuorum)
 
 	// Create and populate the Hash Ring
 	ring := consistenthash.NewHashRing(*vnodesFlag)
-	nodeList := strings.Split(*nodesFlag, ",")
-	for _, n := range nodeList {
+	var allNodes []string
+	health := make(map[string]*nodeHealth)
+	for _, n := range strings.Split(*nodesFlag, ",") {
 		trimmed := strings.TrimSpace(n)
-		if trimmed != "" {
-			ring.AddNode(trimmed)
-			log.Printf("Added physical node to ring: %s", trimmed)
+		if trimmed == "" {
+			continue
 		}
+		ring.AddNode(trimmed)
+		allNodes = append(allNodes, trimmed)
+		health[trimmed] = &nodeHealth{healthy: true, inRing: true}
+		log.Printf("Added physical node to ring: %s", trimmed)
 	}
 
 	proxy := &ProxyServer{
 		ring:              ring,
-		replicationFactor: *replFlag,
+		replicationFactor: replicationFactor,
+		writeQuorum:       writeQuorum,
+		readQuorum:        readQuorum,
+		allNodes:          allNodes,
+		health:            health,
+		metrics:           newProxyMetrics(),
 		client: &http.Client{
 			Timeout: 500 * time.Millisecond,
 		},
+		healthClient: &http.Client{
+			Timeout: 300 * time.Millisecond,
+		},
 	}
+
+	proxy.startHealthChecker(*healthIntervalFlag, *healthFailThresholdFlag, *healthRecoverThresholdFlag)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/set", proxy.handleSet)
-	mux.HandleFunc("/get", proxy.handleGet)
-	mux.HandleFunc("/delete", proxy.handleDelete)
+	mux.HandleFunc("/set", withMetrics("set", proxy.metrics, proxy.handleSet))
+	mux.HandleFunc("/get", withMetrics("get", proxy.metrics, proxy.handleGet))
+	mux.HandleFunc("/delete", withMetrics("delete", proxy.metrics, proxy.handleDelete))
 	mux.HandleFunc("/health", proxy.handleHealth)
+	mux.HandleFunc("/members", proxy.handleMembers)
+	mux.HandleFunc("/metrics", proxy.handleMetrics)
 
-	serverAddr := ":" + *portFlag
-	log.Printf("Listening and serving HTTP Proxy on %s", serverAddr)
-	if err := http.ListenAndServe(serverAddr, mux); err != nil {
-		log.Fatalf("Proxy failed to start: %v", err)
-	}
-}
-
-func (p *ProxyServer) handleSet(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
-		return
+	srv := &http.Server{
+		Addr:    ":" + *portFlag,
+		Handler: mux,
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
-		return
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	var req SetRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		http.Error(w, `{"error": "Invalid JSON format"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Key == "" {
-		http.Error(w, `{"error": "Key is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Find the N replica nodes for this key
-	targetNodes := p.ring.GetNodes(req.Key, p.replicationFactor)
-	if len(targetNodes) == 0 {
-		http.Error(w, `{"error": "No backend nodes available"}`, http.StatusInternalServerError)
-		return
-	}
-
-	var wg sync.WaitGroup
-	successChan := make(chan bool, len(targetNodes))
-
-	// Send write request to all replica nodes in parallel
-	for _, nodeAddr := range targetNodes {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			url := fmt.Sprintf("%s/set", addr)
-			resp, err := p.client.Post(url, "application/json", bytes.NewBuffer(bodyBytes))
-			if err != nil {
-				log.Printf("Replicated write to %s failed: %v", addr, err)
-				successChan <- false
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				successChan <- true
-			} else {
-				log.Printf("Replicated write to %s returned status %d", addr, resp.StatusCode)
-				successChan <- false
-			}
-		}(nodeAddr)
-	}
-
-	wg.Wait()
-	close(successChan)
-
-	successCount := 0
-	for success := range successChan {
-		if success {
-			successCount++
+	go func() {
+		log.Printf("Listening and serving HTTP Proxy on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Proxy failed to start: %v", err)
 		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("Shutdown signal received, draining connections...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v", err)
 	}
 
-	if successCount == 0 {
-		http.Error(w, `{"error": "All replicated write attempts failed"}`, http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("[PROXY SET] Key: %s replicated successfully to %d/%d nodes", req.Key, successCount, len(targetNodes))
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"key":           req.Key,
-		"success":       true,
-		"write_targets": targetNodes,
-		"success_count": successCount,
-	})
-}
-
-func (p *ProxyServer) handleGet(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		http.Error(w, `{"error": "Key is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	targetNodes := p.ring.GetNodes(key, p.replicationFactor)
-	if len(targetNodes) == 0 {
-		http.Error(w, `{"error": "No backend nodes available"}`, http.StatusInternalServerError)
-		return
-	}
-
-	// Try reading from the target nodes sequentially (Failover logic)
-	for i, nodeAddr := range targetNodes {
-		urlStr := fmt.Sprintf("%s/get?key=%s", nodeAddr, url.QueryEscape(key))
-		resp, err := p.client.Get(urlStr)
-		if err != nil {
-			log.Printf("[FAILOVER GET] Attempt %d to %s failed: %v. Trying next replica...", i+1, nodeAddr, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			// Found the key, return the response directly
-			w.Header().Set("Content-Type", "application/json")
-			io.Copy(w, resp.Body)
-			log.Printf("[PROXY GET] Key: %s fetched from %s", key, nodeAddr)
-			return
-		} else if resp.StatusCode == http.StatusNotFound {
-			log.Printf("[PROXY GET] Key: %s not found on %s. Checking replicas...", key, nodeAddr)
-		} else {
-			log.Printf("[FAILOVER GET] Node %s returned status %d. Trying next replica...", nodeAddr, resp.StatusCode)
-		}
-	}
-
-	// If we checked all nodes and none returned the key successfully, return 404 NotFound
-	log.Printf("[PROXY GET] Key: %s not found on any replica", key)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"key":   key,
-		"found": false,
-		"error": "Key not found on any replica nodes",
-	})
-}
-
-func (p *ProxyServer) handleDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		http.Error(w, `{"error": "Key is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	targetNodes := p.ring.GetNodes(key, p.replicationFactor)
-	if len(targetNodes) == 0 {
-		http.Error(w, `{"error": "No backend nodes available"}`, http.StatusInternalServerError)
-		return
-	}
-
-	var wg sync.WaitGroup
-	successChan := make(chan bool, len(targetNodes))
-
-	// Replicate deletion in parallel
-	for _, nodeAddr := range targetNodes {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			reqUrl := fmt.Sprintf("%s/delete?key=%s", addr, url.QueryEscape(key))
-			req, err := http.NewRequest(http.MethodDelete, reqUrl, nil)
-			if err != nil {
-				successChan <- false
-				return
-			}
-			resp, err := p.client.Do(req)
-			if err != nil {
-				log.Printf("Replicated delete from %s failed: %v", addr, err)
-				successChan <- false
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				successChan <- true
-			} else {
-				successChan <- false
-			}
-		}(nodeAddr)
-	}
-
-	wg.Wait()
-	close(successChan)
-
-	successCount := 0
-	for success := range successChan {
-		if success {
-			successCount++
-		}
-	}
-
-	log.Printf("[PROXY DELETE] Key: %s deleted from %d/%d nodes", key, successCount, len(targetNodes))
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"key":           key,
-		"success":       true,
-		"delete_count":  successCount,
-		"total_targets": len(targetNodes),
-	})
+	log.Printf("Proxy stopped cleanly")
 }
 
 func (p *ProxyServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -278,6 +155,45 @@ func (p *ProxyServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": "healthy",
 	})
+}
+
+// handleMembers reports the proxy's current view of each backend node's
+// health, useful for debugging automatic ring membership.
+func (p *ProxyServer) handleMembers(w http.ResponseWriter, r *http.Request) {
+	type memberView struct {
+		Node             string `json:"node"`
+		Healthy          bool   `json:"healthy"`
+		InRing           bool   `json:"in_ring"`
+		ConsecutiveOK    int    `json:"consecutive_ok"`
+		ConsecutiveFails int    `json:"consecutive_fails"`
+	}
+
+	members := make([]memberView, 0, len(p.allNodes))
+	for _, node := range p.allNodes {
+		h := p.health[node]
+		h.mu.Lock()
+		members = append(members, memberView{
+			Node:             node,
+			Healthy:          h.healthy,
+			InRing:           h.inRing,
+			ConsecutiveOK:    h.consecutiveOK,
+			ConsecutiveFails: h.consecutiveFails,
+		})
+		h.mu.Unlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(members)
+}
+
+func clamp(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func getEnv(key, fallback string) string {
@@ -290,6 +206,15 @@ func getEnv(key, fallback string) string {
 func getEnvInt(key string, fallback int) int {
 	if valStr, exists := os.LookupEnv(key); exists {
 		if val, err := strconv.Atoi(valStr); err == nil {
+			return val
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if valStr, exists := os.LookupEnv(key); exists {
+		if val, err := time.ParseDuration(valStr); err == nil {
 			return val
 		}
 	}

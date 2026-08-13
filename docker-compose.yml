@@ -41,7 +41,12 @@ services:
       - PORT=8080
       - NODES=http://cache-node-1:8080,http://cache-node-2:8080,http://cache-node-3:8080
       - VNODES=50
-      - REPLICATION=2
+      - REPLICATION=3
+      - WRITE_QUORUM=2
+      - READ_QUORUM=2
+      - HEALTH_INTERVAL=2s
+      - HEALTH_FAIL_THRESHOLD=3
+      - HEALTH_RECOVER_THRESHOLD=2
     depends_on:
       - cache-node-1
       - cache-node-2

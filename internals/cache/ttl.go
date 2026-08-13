@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"sync/atomic"
 	"time"
 )
 
@@ -25,27 +26,20 @@ func (c *Cache) StopJanitor() {
 	})
 }
 
+// DeleteExpired sweeps every shard for expired keys. Each shard is locked
+// independently and only for the duration of its own sweep, so a large
+// cache doesn't block reads/writes on unrelated shards while cleaning up.
 func (c *Cache) DeleteExpired() {
-	const maxSampleSize = 20
-
 	now := time.Now().UnixNano()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	checked := 0
-	for key, item := range c.store {
-		if item.Expiration > 0 && item.Expiration < now {
-			if elem, ok := c.keys[key]; ok {
-				c.ll.Remove(elem)
-				delete(c.keys, key)
+	for _, s := range c.shards {
+		s.mu.Lock()
+		for key, item := range s.store {
+			if item.Expiration > 0 && item.Expiration < now {
+				s.deleteKey(key)
+				atomic.AddInt64(&s.expirations, 1)
 			}
-			delete(c.store, key)
 		}
-
-		checked++
-		if checked >= maxSampleSize {
-			return
-		}
+		s.mu.Unlock()
 	}
 }
