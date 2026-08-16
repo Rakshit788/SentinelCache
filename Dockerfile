@@ -3,8 +3,8 @@ FROM golang:1.26.1-alpine AS builder
 WORKDIR /app
 COPY go.mod ./
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o cache-server ./cmd/server/main.go
-RUN CGO_ENABLED=0 GOOS=linux go build -o cache-proxy ./cmd/proxy/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o cache-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o cache-proxy ./cmd/proxy
 
 # Run stage
 FROM alpine:latest

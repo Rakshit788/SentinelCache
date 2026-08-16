@@ -82,6 +82,7 @@ Proxy Router :8080
 - Docker image builds both:
   - `cache-server`
   - `cache-proxy`
+  (via `go build ./cmd/server` / `./cmd/proxy` — building the package directory, not a single `main.go`, since both packages are now split across multiple files)
 - Docker Compose defines:
   - `cache-node-1`
   - `cache-node-2`
@@ -105,12 +106,15 @@ Proxy Router :8080
 - **`cmd/benchtool`**, a standalone load generator that records every operation's latency (not just the mean) and reports real p50/p95/p99 percentiles, throughput, and memory/GC stats — `go test -bench` alone can't produce percentiles.
 - **Cache-level metrics**: `Cache.Stats()` returns hits/misses/evictions/expirations, tracked with per-shard atomic counters (summed on read) so scraping stats doesn't itself reintroduce cross-shard lock contention.
 - **Hand-rolled Prometheus `/metrics` endpoint** (`internals/metrics`: `Counter`, `Gauge`, `Histogram` + a text-exposition writer, no external dependency) on both the cache node and the proxy — see [Observability](#observability) below.
+- **Prometheus + Grafana wired into `docker-compose.yml`**, scraping the proxy and all three nodes every 5s, with a provisioned Grafana dashboard (cache hit ratio, per-node hits/misses/evictions/expirations, request rate and p50/p95/p99 latency by method, quorum success/failure, replica failures, healthy/ring node counts) — see [Observability](#observability).
+- Verified live end-to-end: brought the full 7-service stack up, generated real traffic, and confirmed data flowing through Prometheus's targets page and the Grafana dashboard (captured via headless Chromium, since Grafana's own `/render` image-rendering API turned out to be broken in this image pairing — see the note in [Observability](#observability)).
 
 ## What Is Partially Done
 
 - Docker Compose includes the proxy, but service health checks are not defined yet (the proxy has its own internal health checker independent of Compose's).
 - Deletes are not versioned (no tombstones), so a delete is best-effort across quorum — a replica that misses a delete can still be "read-repaired" back to life by a stale replica's stale-but-versioned value. This needs a tombstone + garbage-collection design (see Self-Healing Features below).
 - Automatic ring membership reacts to health, but there's no rebalancing/data migration when a node's ring position changes — keys simply hash to whatever nodes are currently in the ring.
+- Grafana's built-in `/render` image-rendering API (for exporting dashboard panels as PNGs, e.g. for reports) does not work against the current `grafana/grafana` + `grafana/grafana-image-renderer` image pairing — the renderer rejects Grafana's callback regardless of token configuration, most likely a protocol version mismatch between the two `:latest` images. Screenshotting the dashboard is still possible (headless Chromium against the dashboard URL directly, bypassing the renderer's HTTP API — see [Observability](#observability)), but the one-click render-to-PNG feature itself is broken until the images are pinned to a known-compatible pair.
 
 ## What Is Left
 
@@ -161,7 +165,7 @@ Proxy Router :8080
 3. Add hinted handoff so a replica that's down during a write catches up as soon as it's healthy again, not just lazily on the next read.
 4. Add `.dockerignore` and Docker Compose health checks.
 5. Add `/stats` to cache nodes.
-6. Wire Prometheus + Grafana into `docker-compose.yml` to actually visualize the `/metrics` output instead of just curling it.
+6. Pin `grafana/grafana` and `grafana/grafana-image-renderer` to a known-compatible version pair to fix the broken `/render` API (see [What Is Partially Done](#what-is-partially-done)).
 7. Start gossip membership once hinted handoff and tombstones are in place.
 
 ## Run With Docker Compose
@@ -180,6 +184,13 @@ Services:
 | cache-node-1 | 8081 | 8080 |
 | cache-node-2 | 8082 | 8080 |
 | cache-node-3 | 8083 | 8080 |
+| prometheus | 9090 | 9090 |
+| grafana | 3000 | 3000 |
+| grafana-renderer | 8091 | 8081 |
+
+Grafana is provisioned automatically (datasource + the "SentinelCache" dashboard from `monitoring/grafana/`) — no manual setup needed. Open `http://localhost:3000/d/sentinelcache/sentinelcache` directly (the root `http://localhost:3000` lands on Grafana's empty Home page, not this dashboard). Login `admin` / `admin`, or just browse anonymously (enabled as Viewer for local dev). Prometheus's own UI, including its targets/scrape-health page, is at `http://localhost:9090/targets`.
+
+The dashboard's panels use 1-minute rate windows, so they go flat within a minute or two of no traffic — set the time range picker to "Last 5 minutes" with a 5s refresh and generate some traffic (see below) to see it live.
 
 Check proxy health:
 
@@ -301,7 +312,20 @@ Try it against a running node or proxy:
 Invoke-RestMethod -Method Get -Uri "http://localhost:8080/metrics"
 ```
 
-To scrape it with Prometheus, add a job like this to `prometheus.yml` and point it at the proxy and each node:
+### Prometheus + Grafana (docker-compose)
+
+`docker compose up -d` (see [Run With Docker Compose](#run-with-docker-compose)) brings up the full observability stack alongside the cache cluster:
+
+- **Prometheus** (`monitoring/prometheus.yml`) scrapes `/metrics` on the proxy and all three cache nodes every 5s.
+- **Grafana** auto-provisions a Prometheus datasource and a "SentinelCache" dashboard (`monitoring/grafana/`) with panels for cache hit ratio, per-node hits/misses/evictions/expirations, request rate and p50/p95/p99 latency by method, quorum success/failure, replica read/write failures, and healthy/ring node counts.
+- **grafana-image-renderer** is included for headless dashboard screenshots, but its `/render` HTTP API doesn't currently work against this Grafana version (see [What Is Partially Done](#what-is-partially-done)). A working fallback: run Chromium directly inside the renderer container against the dashboard URL, since it already has `chromium` installed and sits on the same Docker network as Grafana:
+
+```powershell
+docker exec go-cache-grafana-renderer-1 chromium --headless --disable-gpu --no-sandbox --hide-scrollbars --window-size=1500,1700 --virtual-time-budget=10000 --run-all-compositor-stages-before-draw --screenshot=/tmp/dashboard.png "http://grafana:3000/d/sentinelcache/sentinelcache?orgId=1&kiosk&from=now-5m&to=now"
+docker cp go-cache-grafana-renderer-1:/tmp/dashboard.png ./dashboard.png
+```
+
+To point an external Prometheus at the cluster instead (without Compose), scrape the proxy and each node directly:
 
 ```yaml
 scrape_configs:
@@ -310,8 +334,6 @@ scrape_configs:
       - targets: ["localhost:8080", "localhost:8081", "localhost:8082", "localhost:8083"]
 ```
 
-Not yet wired up: an actual `prometheus`/`grafana` service in `docker-compose.yml` to scrape and visualize this (see [Recommended Next Steps](#recommended-next-steps)) — today it's `/metrics` you can curl or point an external Prometheus at.
-
 ## Project Pitch
 
-SentinelCache is a distributed cache in Go. Each node provides TTL and LRU-based in-memory storage, sharded across 32 independently-locked segments so concurrent access to unrelated keys doesn't contend, with lazy and active TTL expiry, versioned values, and graceful shutdown. A proxy uses consistent hashing with virtual nodes to route keys, replicating writes with configurable quorum (W) and serving reads with configurable quorum (R), resolving conflicts by picking the highest-version replica response. The proxy continuously health-checks every node, automatically removing failed nodes from the ring and re-adding them once they recover, and asynchronously read-repairs any replica that fell behind. Sharding the cache is backed by measured numbers, not a guess: on the reference machine it moved concurrent GET throughput from ~2.08M to ~10.28M ops/sec (~4.9x) with p99 latency dropping ~2.2x (see [Benchmarks](#benchmarks)), and every node/proxy exposes a hand-rolled Prometheus `/metrics` endpoint for live cache, request, quorum, and replication-health stats (see [Observability](#observability)). The next milestones are tombstoned deletes, hinted handoff, and a gossip-based membership protocol to replace the current static node list.
+SentinelCache is a distributed cache in Go. Each node provides TTL and LRU-based in-memory storage, sharded across 32 independently-locked segments so concurrent access to unrelated keys doesn't contend, with lazy and active TTL expiry, versioned values, and graceful shutdown. A proxy uses consistent hashing with virtual nodes to route keys, replicating writes with configurable quorum (W) and serving reads with configurable quorum (R), resolving conflicts by picking the highest-version replica response. The proxy continuously health-checks every node, automatically removing failed nodes from the ring and re-adding them once they recover, and asynchronously read-repairs any replica that fell behind. Sharding the cache is backed by measured numbers, not a guess: on the reference machine it moved concurrent GET throughput from ~2.08M to ~10.28M ops/sec (~4.9x) with p99 latency dropping ~2.2x (see [Benchmarks](#benchmarks)), and every node/proxy exposes a hand-rolled Prometheus `/metrics` endpoint for live cache, request, quorum, and replication-health stats, scraped by a Prometheus + Grafana stack that ships in `docker-compose.yml` with an auto-provisioned dashboard (see [Observability](#observability)). The next milestones are tombstoned deletes, hinted handoff, and a gossip-based membership protocol to replace the current static node list.
